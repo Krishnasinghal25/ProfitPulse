@@ -1,0 +1,836 @@
+exec(r'''
+# ============================================================
+# INT315: BANK MARKETING ANALYSIS AND DEPOSIT PREDICTION
+# Complete standalone code for all 15 objectives
+# ============================================================
+
+from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
+from pyspark.ml import Pipeline
+from pyspark.ml.feature import (
+    StringIndexer,
+    OneHotEncoder,
+    VectorAssembler
+)
+from pyspark.ml.classification import (
+    LogisticRegression,
+    DecisionTreeClassifier
+)
+from pyspark.ml.evaluation import (
+    BinaryClassificationEvaluator,
+    MulticlassClassificationEvaluator
+)
+
+spark = (
+    SparkSession.builder
+    .appName("BankMarketingProject")
+    .getOrCreate()
+)
+
+spark.sparkContext.setLogLevel("ERROR")
+spark.conf.set("spark.sql.shuffle.partitions", "8")
+
+
+def heading(number, problem):
+    print("\n" + "=" * 75)
+    print("OBJECTIVE", number)
+    print("=" * 75)
+    print("PROBLEM STATEMENT:", problem)
+    print("\nSOLUTION / OUTPUT:")
+
+
+def conclusion(text):
+    print("\nSOLUTION IN WORDS:", text)
+    print("-" * 75)
+
+
+# ============================================================
+# OBJECTIVE 1
+# Problem statement: Load the dataset and inspect its structure.
+# ============================================================
+
+heading(
+    1,
+    "Load the bank marketing dataset and identify its "
+    "number of records, columns, and data types."
+)
+
+path = (
+    "file:///mnt/c/Users/krish/OneDrive/Desktop/"
+    "acedemic notes/cluster_computing ca2/bank/bank-full.csv"
+)
+
+df = (
+    spark.read
+    .option("header", True)
+    .option("sep", ";")
+    .option("inferSchema", True)
+    .option("mode", "FAILFAST")
+    .csv(path)
+    .cache()
+)
+
+total_rows = df.count()
+
+print("Rows:", total_rows)
+print("Columns:", len(df.columns))
+df.printSchema()
+df.show(5, truncate=False)
+
+conclusion(
+    f"The dataset was loaded successfully with "
+    f"{total_rows:,} records and {len(df.columns)} columns."
+)
+
+
+# ============================================================
+# OBJECTIVE 2
+# Problem statement: Check nulls, duplicates and unknown values.
+# ============================================================
+
+heading(
+    2,
+    "Identify null values, exact duplicate records, "
+    "and unknown categorical values."
+)
+
+null_counts = df.select([
+    F.sum(F.col(c).isNull().cast("int")).alias(c)
+    for c in df.columns
+])
+
+print("Null values:")
+null_counts.show(truncate=False)
+
+total_nulls = sum(
+    value or 0
+    for value in null_counts.first().asDict().values()
+)
+
+duplicate_count = total_rows - df.dropDuplicates().count()
+print("Exact duplicate rows:", duplicate_count)
+
+string_columns = [
+    name for name, dtype in df.dtypes
+    if dtype == "string"
+]
+
+print("Unknown category counts:")
+
+df.select([
+    F.sum(
+        F.when(F.col(c) == "unknown", 1).otherwise(0)
+    ).alias(c)
+    for c in string_columns
+]).show(truncate=False)
+
+conclusion(
+    f"The dataset contains {total_nulls:,} null cells and "
+    f"{duplicate_count:,} exact duplicate rows. "
+    "'unknown' is retained as a categorical value. "
+    "The value pdays = -1 means not previously contacted."
+)
+
+
+# ============================================================
+# OBJECTIVE 3
+# Problem statement: Calculate numerical descriptive statistics.
+# ============================================================
+
+heading(
+    3,
+    "Calculate descriptive statistics for customer age, "
+    "balance, and numerical campaign attributes."
+)
+
+numeric_columns = [
+    "age", "balance", "day", "duration",
+    "campaign", "pdays", "previous"
+]
+
+df.select(numeric_columns).summary(
+    "count", "mean", "stddev",
+    "min", "25%", "50%", "75%", "max"
+).show(truncate=False)
+
+stats = df.agg(
+    F.min("age").alias("min_age"),
+    F.max("age").alias("max_age"),
+    F.avg("age").alias("avg_age"),
+    F.avg("balance").alias("avg_balance")
+).first()
+
+conclusion(
+    f"Customer ages range from {stats['min_age']} to "
+    f"{stats['max_age']} years, with an average of "
+    f"{stats['avg_age']:.2f} years. The average yearly "
+    f"account balance is {stats['avg_balance']:.2f} euros."
+)
+
+
+# ============================================================
+# OBJECTIVE 4
+# Problem statement: Analyse target distribution and imbalance.
+# ============================================================
+
+heading(
+    4,
+    "Calculate subscriber and non-subscriber counts "
+    "and identify class imbalance."
+)
+
+df.groupBy("y").count().withColumn(
+    "percentage",
+    F.round(F.col("count") * 100.0 / total_rows, 2)
+).orderBy("y").show()
+
+yes_count = df.filter(F.col("y") == "yes").count()
+no_count = df.filter(F.col("y") == "no").count()
+
+analysis_df = (
+    df.filter(F.col("y").isin("yes", "no"))
+    .withColumn(
+        "label",
+        F.when(F.col("y") == "yes", 1.0).otherwise(0.0)
+    )
+)
+
+conclusion(
+    f"{yes_count:,} customers "
+    f"({yes_count / total_rows * 100:.2f}%) subscribed, "
+    f"while {no_count:,} customers "
+    f"({no_count / total_rows * 100:.2f}%) did not. "
+    "The dataset is imbalanced because non-subscribers "
+    "form the majority. Labels are no = 0 and yes = 1."
+)
+
+
+# ============================================================
+# OBJECTIVE 5
+# Problem statement: Count occupations using RDD operations.
+# ============================================================
+
+heading(
+    5,
+    "Use RDD map and reduceByKey operations to count "
+    "customers belonging to each occupation."
+)
+
+job_counts_rdd = (
+    df.select("job").rdd
+    .map(lambda row: (row["job"], 1))
+    .reduceByKey(lambda a, b: a + b)
+)
+
+job_counts_df = job_counts_rdd.toDF(
+    ["job", "customer_count"]
+).orderBy(
+    F.desc("customer_count"), "job"
+)
+
+job_counts_df.show(truncate=False)
+largest_job = job_counts_df.first()
+
+conclusion(
+    "RDD transformations counted the records for each job. "
+    f"The largest occupation group is "
+    f"'{largest_job['job']}', with "
+    f"{largest_job['customer_count']:,} records."
+)
+
+
+# ============================================================
+# OBJECTIVE 6
+# Problem statement: Compare subscription rates by age group.
+# ============================================================
+
+heading(
+    6,
+    "Group customers by age and compare their "
+    "term deposit subscription rates."
+)
+
+age_df = analysis_df.withColumn(
+    "age_group",
+    F.when(F.col("age") < 30, "Below 30")
+    .when(F.col("age") < 40, "30-39")
+    .when(F.col("age") < 50, "40-49")
+    .when(F.col("age") < 60, "50-59")
+    .otherwise("60 and above")
+)
+
+age_summary = age_df.groupBy("age_group").agg(
+    F.count("*").alias("customers"),
+    F.sum("label").cast("long").alias("subscribers"),
+    (F.avg("label") * 100).alias("subscription_rate_pct")
+).orderBy(
+    F.desc("subscription_rate_pct")
+)
+
+age_summary.show(truncate=False)
+best_age = age_summary.first()
+
+conclusion(
+    f"The '{best_age['age_group']}' age group has the "
+    f"highest observed subscription rate of "
+    f"{best_age['subscription_rate_pct']:.2f}%."
+)
+
+
+# ============================================================
+# OBJECTIVE 7
+# Problem statement: Analyse jobs and education using Spark SQL.
+# ============================================================
+
+heading(
+    7,
+    "Use Spark SQL to compare subscription rates "
+    "by occupation and education level."
+)
+
+analysis_df.createOrReplaceTempView("bank")
+
+job_rates = spark.sql("""
+    SELECT
+        job,
+        COUNT(*) AS customers,
+        AVG(label) * 100 AS subscription_rate_pct
+    FROM bank
+    GROUP BY job
+    ORDER BY subscription_rate_pct DESC
+""")
+
+education_rates = spark.sql("""
+    SELECT
+        education,
+        COUNT(*) AS customers,
+        AVG(label) * 100 AS subscription_rate_pct
+    FROM bank
+    GROUP BY education
+    ORDER BY subscription_rate_pct DESC
+""")
+
+print("Subscription rates by job:")
+job_rates.show(truncate=False)
+
+print("Subscription rates by education:")
+education_rates.show(truncate=False)
+
+best_job = job_rates.first()
+best_education = education_rates.first()
+
+conclusion(
+    f"'{best_job['job']}' has the highest observed "
+    f"job-category subscription rate at "
+    f"{best_job['subscription_rate_pct']:.2f}%. "
+    f"Among education categories, "
+    f"'{best_education['education']}' has the highest "
+    f"rate at {best_education['subscription_rate_pct']:.2f}%."
+)
+
+
+# ============================================================
+# OBJECTIVE 8
+# Problem statement: Analyse loan status and subscriptions.
+# ============================================================
+
+heading(
+    8,
+    "Compare subscription rates for different combinations "
+    "of housing loans and personal loans."
+)
+
+loan_summary = analysis_df.groupBy("housing", "loan").agg(
+    F.count("*").alias("customers"),
+    F.round(F.avg("balance"), 2).alias("average_balance"),
+    (F.avg("label") * 100).alias("subscription_rate_pct")
+).orderBy(
+    F.desc("subscription_rate_pct")
+)
+
+loan_summary.show(truncate=False)
+best_loan = loan_summary.first()
+
+conclusion(
+    f"Customers with housing loan = '{best_loan['housing']}' "
+    f"and personal loan = '{best_loan['loan']}' have the "
+    f"highest observed subscription rate of "
+    f"{best_loan['subscription_rate_pct']:.2f}%. "
+    "This is an association, not proof of causation."
+)
+
+
+# ============================================================
+# OBJECTIVE 9
+# Problem statement: Analyse contact methods and campaign months.
+# ============================================================
+
+heading(
+    9,
+    "Compare historical subscription rates across "
+    "contact methods and campaign months."
+)
+
+contact_summary = analysis_df.groupBy("contact").agg(
+    F.count("*").alias("customers"),
+    (F.avg("label") * 100).alias("subscription_rate_pct")
+).orderBy(
+    F.desc("subscription_rate_pct")
+)
+
+month_summary = analysis_df.groupBy("month").agg(
+    F.count("*").alias("customers"),
+    (F.avg("label") * 100).alias("subscription_rate_pct")
+).orderBy(
+    F.desc("subscription_rate_pct")
+)
+
+print("Contact methods:")
+contact_summary.show(truncate=False)
+
+print("Campaign months:")
+month_summary.show(truncate=False)
+
+best_contact = contact_summary.first()
+best_month = month_summary.first()
+
+conclusion(
+    f"'{best_contact['contact']}' has the highest observed "
+    f"contact-method subscription rate at "
+    f"{best_contact['subscription_rate_pct']:.2f}%. "
+    f"The highest monthly rate is "
+    f"{best_month['subscription_rate_pct']:.2f}% in "
+    f"'{best_month['month']}', based on "
+    f"{best_month['customers']:,} records. "
+    "Different group sizes and customer selection "
+    "must be considered when interpreting these rates."
+)
+
+
+# ============================================================
+# OBJECTIVE 10
+# Problem statement: Analyse previous outcomes using an SQL join.
+# ============================================================
+
+heading(
+    10,
+    "Use an SQL LEFT JOIN to attach descriptions of previous "
+    "campaign outcomes and compare current subscription rates."
+)
+
+outcome_lookup = spark.createDataFrame(
+    [
+        ("success", "Previous campaign succeeded"),
+        ("failure", "Previous campaign failed"),
+        ("other", "Other previous outcome"),
+        ("unknown", "Previous outcome unknown")
+    ],
+    ["outcome_code", "outcome_description"]
+)
+
+outcome_lookup.createOrReplaceTempView("outcome_lookup")
+
+outcome_summary = spark.sql("""
+    SELECT
+        b.poutcome,
+        o.outcome_description,
+        COUNT(*) AS customers,
+        AVG(b.label) * 100 AS subscription_rate_pct
+    FROM bank b
+    LEFT JOIN outcome_lookup o
+        ON b.poutcome = o.outcome_code
+    GROUP BY b.poutcome, o.outcome_description
+    ORDER BY subscription_rate_pct DESC
+""")
+
+outcome_summary.show(truncate=False)
+best_outcome = outcome_summary.first()
+
+conclusion(
+    "The LEFT JOIN added readable outcome descriptions. "
+    f"The previous outcome '{best_outcome['poutcome']}' "
+    f"is associated with the highest observed current "
+    f"subscription rate of "
+    f"{best_outcome['subscription_rate_pct']:.2f}%."
+)
+
+
+# ============================================================
+# OBJECTIVE 11
+# Problem statement: Select features and split the dataset.
+# ============================================================
+
+heading(
+    11,
+    "Select prediction features and split the data "
+    "into approximately 80% training and 20% testing."
+)
+
+categorical_features = [
+    "job", "marital", "education", "default",
+    "housing", "loan", "contact", "month", "poutcome"
+]
+
+numeric_features = [
+    "age", "balance", "day",
+    "campaign", "pdays", "previous"
+]
+
+# Duration is excluded because it is known after the call.
+# The target y must not be included as an input feature.
+# Contact date, method and attempt count are assumed known
+# at prediction time.
+
+model_df = (
+    analysis_df
+    .select(
+        *(categorical_features + numeric_features + ["label"])
+    )
+    .na.fill("unknown", subset=categorical_features)
+    .na.drop(subset=numeric_features)
+)
+
+train_df, test_df = model_df.randomSplit(
+    [0.8, 0.2],
+    seed=42
+)
+
+train_df = train_df.cache()
+test_df = test_df.cache()
+
+train_count = train_df.count()
+test_count = test_df.count()
+
+print("Categorical inputs:", categorical_features)
+print("Numerical inputs:", numeric_features)
+print("Training records:", train_count)
+print("Testing records:", test_count)
+
+print("Training label distribution:")
+train_df.groupBy("label").count().orderBy("label").show()
+
+print("Testing label distribution:")
+test_df.groupBy("label").count().orderBy("label").show()
+
+conclusion(
+    f"The dataset was split into {train_count:,} training "
+    f"records and {test_count:,} testing records. "
+    "There are 15 input columns: 9 categorical and 6 numerical. "
+    "The target y and post-call duration are excluded. "
+    "This random split is a coursework holdout experiment, "
+    "not a time-based evaluation of future campaigns."
+)
+
+
+# ============================================================
+# OBJECTIVE 12
+# Problem statement: Encode and assemble model features.
+# ============================================================
+
+heading(
+    12,
+    "Encode categorical variables and combine all inputs "
+    "into a feature vector using a Spark ML pipeline."
+)
+
+indexers = [
+    StringIndexer(
+        inputCol=c,
+        outputCol=c + "_index",
+        handleInvalid="keep"
+    )
+    for c in categorical_features
+]
+
+encoder = OneHotEncoder(
+    inputCols=[
+        c + "_index" for c in categorical_features
+    ],
+    outputCols=[
+        c + "_encoded" for c in categorical_features
+    ],
+    handleInvalid="keep"
+)
+
+assembler = VectorAssembler(
+    inputCols=(
+        numeric_features
+        + [c + "_encoded" for c in categorical_features]
+    ),
+    outputCol="features"
+)
+
+preprocessing_pipeline = Pipeline(
+    stages=indexers + [encoder, assembler]
+)
+
+# Fit preprocessing only on training data.
+preprocessing_model = preprocessing_pipeline.fit(train_df)
+
+train_ready = (
+    preprocessing_model.transform(train_df)
+    .select("features", "label")
+    .cache()
+)
+
+test_ready = (
+    preprocessing_model.transform(test_df)
+    .select("features", "label")
+    .cache()
+)
+
+train_ready.show(5, truncate=False)
+
+vector_size = (
+    train_ready.select("features").first()["features"].size
+)
+
+conclusion(
+    "StringIndexer and OneHotEncoder encoded the categorical "
+    "variables. VectorAssembler combined the inputs into "
+    f"a feature vector with {vector_size} positions. "
+    "Preprocessing was fitted only on the training set "
+    "to prevent information leakage from the test set."
+)
+
+
+# ============================================================
+# COMMON MODEL EVALUATION HELPERS
+# ============================================================
+
+accuracy_evaluator = MulticlassClassificationEvaluator(
+    labelCol="label",
+    predictionCol="prediction",
+    metricName="accuracy"
+)
+
+roc_evaluator = BinaryClassificationEvaluator(
+    labelCol="label",
+    rawPredictionCol="probability",
+    metricName="areaUnderROC"
+)
+
+pr_evaluator = BinaryClassificationEvaluator(
+    labelCol="label",
+    rawPredictionCol="probability",
+    metricName="areaUnderPR"
+)
+
+
+def get_metrics(name, predictions):
+    counts = {
+        (int(row["label"]), int(row["prediction"])): row["count"]
+        for row in predictions.groupBy(
+            "label", "prediction"
+        ).count().collect()
+    }
+
+    tn = counts.get((0, 0), 0)
+    fp = counts.get((0, 1), 0)
+    fn = counts.get((1, 0), 0)
+    tp = counts.get((1, 1), 0)
+
+    precision = tp / (tp + fp) if tp + fp else 0.0
+    recall = tp / (tp + fn) if tp + fn else 0.0
+
+    f1 = (
+        2 * precision * recall / (precision + recall)
+        if precision + recall else 0.0
+    )
+
+    return {
+        "model": name,
+        "accuracy": accuracy_evaluator.evaluate(predictions),
+        "roc_auc": roc_evaluator.evaluate(predictions),
+        "pr_auc": pr_evaluator.evaluate(predictions),
+        "yes_precision": precision,
+        "yes_recall": recall,
+        "yes_f1": f1,
+        "TN": tn,
+        "FP": fp,
+        "FN": fn,
+        "TP": tp
+    }
+
+
+# ============================================================
+# OBJECTIVE 13
+# Problem statement: Train and evaluate Logistic Regression.
+# ============================================================
+
+heading(
+    13,
+    "Train a Logistic Regression classifier to predict "
+    "term deposit subscriptions."
+)
+
+lr = LogisticRegression(
+    featuresCol="features",
+    labelCol="label",
+    maxIter=100,
+    regParam=0.1,
+    standardization=True
+)
+
+lr_model = lr.fit(train_ready)
+lr_predictions = lr_model.transform(test_ready).cache()
+
+lr_predictions.select(
+    "label", "prediction", "probability"
+).show(10, truncate=False)
+
+lr_metrics = get_metrics(
+    "Logistic Regression",
+    lr_predictions
+)
+
+conclusion(
+    f"Logistic Regression achieved "
+    f"{lr_metrics['accuracy'] * 100:.2f}% test accuracy "
+    f"and {lr_metrics['yes_recall'] * 100:.2f}% subscriber "
+    f"recall. It correctly identified "
+    f"{lr_metrics['TP']:,} actual subscribers. "
+    "The probability vector shows [P(no), P(yes)]."
+)
+
+
+# ============================================================
+# OBJECTIVE 14
+# Problem statement: Train and evaluate a Decision Tree.
+# ============================================================
+
+heading(
+    14,
+    "Train a Decision Tree classifier using the same "
+    "training and testing data."
+)
+
+dt = DecisionTreeClassifier(
+    featuresCol="features",
+    labelCol="label",
+    maxDepth=5,
+    seed=42
+)
+
+dt_model = dt.fit(train_ready)
+dt_predictions = dt_model.transform(test_ready).cache()
+
+dt_predictions.select(
+    "label", "prediction", "probability"
+).show(10, truncate=False)
+
+dt_metrics = get_metrics(
+    "Decision Tree",
+    dt_predictions
+)
+
+conclusion(
+    f"The Decision Tree achieved "
+    f"{dt_metrics['accuracy'] * 100:.2f}% test accuracy "
+    f"and {dt_metrics['yes_recall'] * 100:.2f}% subscriber "
+    f"recall. It correctly identified "
+    f"{dt_metrics['TP']:,} actual subscribers."
+)
+
+
+# ============================================================
+# OBJECTIVE 15
+# Problem statement: Compare classifiers and baseline accuracy.
+# ============================================================
+
+heading(
+    15,
+    "Compare both models using accuracy, ROC-AUC, PR-AUC, "
+    "subscriber precision, recall, F1, and confusion matrices."
+)
+
+metric_columns = [
+    "model", "accuracy", "roc_auc", "pr_auc",
+    "yes_precision", "yes_recall", "yes_f1"
+]
+
+metrics_list = [lr_metrics, dt_metrics]
+
+comparison_df = spark.createDataFrame(
+    [
+        tuple(m[c] for c in metric_columns)
+        for m in metrics_list
+    ],
+    metric_columns
+)
+
+comparison_df.select(
+    "model",
+    *[
+        F.round(F.col(c), 4).alias(c)
+        for c in metric_columns
+        if c != "model"
+    ]
+).show(truncate=False)
+
+for metrics, predictions in [
+    (lr_metrics, lr_predictions),
+    (dt_metrics, dt_predictions)
+]:
+    print("\nConfusion matrix:", metrics["model"])
+    print("Rows = actual label; columns = predicted label")
+    print("0 = No subscription; 1 = Subscription")
+
+    predictions.groupBy("label").pivot(
+        "prediction", [0.0, 1.0]
+    ).count().fillna(0).orderBy("label").show()
+
+    print(
+        "TN:", metrics["TN"],
+        "FP:", metrics["FP"],
+        "FN:", metrics["FN"],
+        "TP:", metrics["TP"]
+    )
+
+baseline_accuracy = (
+    test_df.filter(F.col("label") == 0.0).count()
+    / test_count
+)
+
+best_recall = max(
+    metrics_list,
+    key=lambda item: item["yes_recall"]
+)
+
+best_auc = max(
+    metrics_list,
+    key=lambda item: item["roc_auc"]
+)
+
+print(
+    "\nAlways predicting NO gives accuracy:",
+    f"{baseline_accuracy * 100:.2f}%"
+)
+
+conclusion(
+    f"{best_recall['model']} has the highest subscriber "
+    f"recall among the compared models at "
+    f"{best_recall['yes_recall'] * 100:.2f}%. "
+    f"{best_auc['model']} has the highest ROC-AUC "
+    f"at {best_auc['roc_auc']:.4f}. "
+    f"Always predicting 'no' already gives "
+    f"{baseline_accuracy * 100:.2f}% accuracy, "
+    "so accuracy alone is insufficient. Precision, recall, "
+    "F1 and PR-AUC help assess performance on subscribers."
+)
+
+
+# Release cached memory without closing the PySpark shell.
+lr_predictions.unpersist()
+dt_predictions.unpersist()
+train_ready.unpersist()
+test_ready.unpersist()
+train_df.unpersist()
+test_df.unpersist()
+df.unpersist()
+
+print("\n" + "=" * 75)
+print("ALL 15 OBJECTIVES COMPLETED SUCCESSFULLY.")
+print("Each objective includes its problem, output and conclusion.")
+print("=" * 75)
+''')
